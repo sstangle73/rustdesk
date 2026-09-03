@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:flutter_hbb/common/shared_state.dart';
 import 'package:flutter_hbb/common/widgets/toolbar.dart';
 import 'package:flutter_hbb/consts.dart';
@@ -81,6 +83,77 @@ const kAutoPairedInserts = {
   '（）',
   '【】',
 };
+
+// ── Soft-keyboard trace ────────────────────────────────────────────────────
+//
+// Records the exact (text, selection, composing) triples the IME emits, so real
+// Gboard behaviour can be replayed as fixtures in
+// home-network-docs/rustdesk/keyboard-difftest/ .
+//
+// This exists because every bug in this handler so far was found by USING the
+// app, not by testing it: a harness written from imagination was wrong four
+// times about what Gboard actually does. Capture reality, then assert on it.
+//
+// Set to false to compile the tracer out entirely.
+const kTraceSoftKeyboard = true;
+
+// Characters of context logged either side of the caret. The buffer is ~1536
+// characters of padding; only the neighbourhood of the caret carries meaning.
+const _kTraceWindow = 32;
+
+class _SoftKeyboardTrace {
+  static File? _file;
+  static Future<void> _chain = Future.value();
+  static int _seq = 0;
+  static bool _init = false;
+
+  /// Deterministic and reachable without adb:
+  /// /storage/emulated/0/Android/data/<applicationId>/files/kbd-trace.log
+  static Future<void> _ensure() async {
+    if (_init) return;
+    _init = true;
+    try {
+      final dir = await getExternalStorageDirectory();
+      if (dir == null) return;
+      final f = File('${dir.path}/kbd-trace.log');
+      await f.writeAsString(
+        '\n==== session ${DateTime.now().toIso8601String()} ====\n',
+        mode: FileMode.append,
+      );
+      _file = f;
+    } catch (_) {
+      // Tracing must never take the session down with it.
+    }
+  }
+
+  static String _escape(String s) => s
+      .replaceAll('\\', '\\\\')
+      .replaceAll('\n', '\\n')
+      .replaceAll('\t', '\\t');
+
+  /// A window around the caret, with the caret marked as `|`. Everything
+  /// outside it is padding and carries no information.
+  static String _window(String text, int caret) {
+    final lo = (caret - _kTraceWindow).clamp(0, text.length);
+    final hi = (caret + _kTraceWindow).clamp(0, text.length);
+    final c = caret.clamp(0, text.length);
+    return '${_escape(text.substring(lo, c))}|${_escape(text.substring(c, hi))}';
+  }
+
+  static void log(String phase, String text, int caret, TextRange composing,
+      String decision) {
+    if (!kTraceSoftKeyboard) return;
+    final line = 'n=${_seq++} $phase len=${text.length} caret=$caret '
+        'comp=${composing.start}:${composing.end} '
+        'win="${_window(text, caret)}" $decision\n';
+    _chain = _chain.then((_) async {
+      await _ensure();
+      try {
+        await _file?.writeAsString(line, mode: FileMode.append);
+      } catch (_) {}
+    });
+  }
+}
 
 // What to do about one local change. `null` from [_replay] means "cannot
 // express this - rebuild the buffer and send nothing".
@@ -483,6 +556,16 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     if (text == _value && caret == _lastCaret) return;
 
     final ops = _replay(_value, _lastCaret, text, caret);
+    if (kTraceSoftKeyboard) {
+      final d = ops == null
+          ? 'BAIL'
+          : 'ops=b${ops.arrowsBefore},d${ops.backspaces},'
+              'i"${_SoftKeyboardTrace._escape(ops.insert)}",a${ops.arrowsAfter}';
+      // `prev` is the caret we measured deltas FROM, which is what a fixture
+      // needs; the text itself is in the previous line's window.
+      _SoftKeyboardTrace.log(
+          'CHANGE', text, caret, v.composing, 'prev=$_lastCaret $d');
+    }
     _value = text;
     _lastCaret = caret;
 
@@ -532,6 +615,10 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   /// writing the controller notifies the listener, which would otherwise read
   /// the rebuild back as a gigantic user edit.
   void _refillPad() {
+    if (kTraceSoftKeyboard) {
+      _SoftKeyboardTrace.log('REFILL', _value, _lastCaret,
+          const TextRange(start: -1, end: -1), 'coordinate frame reset');
+    }
     _suppressLocalSync = true;
     _value = _freshPad;
     _textController.value = TextEditingValue(
