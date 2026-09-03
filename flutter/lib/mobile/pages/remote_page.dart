@@ -206,9 +206,29 @@ _Ops? _replay(String oldText, int oldCaret, String newText, int newCaret) {
   // Tolerate a small shrink and do not replay it. Those characters are padding:
   // the remote never received them, and forward-deleting there would destroy
   // the user's real text. The padding is repaired afterwards instead.
-  final absorbed =
-      (oldText.length - oldCaret) - (newText.length - newCaret);
-  if (absorbed < 0 || absorbed > kMaxPadAbsorb) return null;
+  // What sits right of the caret should be exactly the padding. Two deviations,
+  // both from real traces, and they are NOT symmetric:
+  //
+  //  - SHORT: Gboard ate a pad space. It appends a space when correcting a word
+  //    and will not create a double space, so it takes ours. That is padding
+  //    the remote never received: ignore it, and repair the strip afterwards.
+  //
+  //  - LONG: Gboard left real text right of the caret ("loving." -> "loging "
+  //    with the caret BEFORE the space). That is the user's text. Send it and
+  //    walk the caret back over it - treating it as padding drops a character,
+  //    which is what the first attempt at this did until the harness caught it.
+  //
+  // Either way a bail-out here throws the WHOLE correction away, which is how
+  // both of these presented: autocorrect working intermittently.
+  if (((oldText.length - oldCaret) - (newText.length - newCaret)).abs() >
+      kMaxPadAbsorb) {
+    return null;
+  }
+  final rightText = newText.substring(newCaret);
+  var trailing = '';
+  if (rightText.length > _padRight.length && rightText.endsWith(_padRight)) {
+    trailing = rightText.substring(0, rightText.length - _padRight.length);
+  }
 
   final o = oldText.substring(0, oldCaret).characters.toList();
   final n = newText.substring(0, newCaret).characters.toList();
@@ -220,11 +240,12 @@ _Ops? _replay(String oldText, int oldCaret, String newText, int newCaret) {
   }
 
   final deleted = o.length - p;
-  final inserted = n.sublist(p).join();
+  final inserted = n.sublist(p).join() + trailing;
   if (deleted > kMaxResync) return null;
 
   final before = (p + deleted) - oldCaret;
-  final after = newCaret - (p + inserted.characters.length);
+  // Anything sent PAST the caret has to be walked back over afterwards.
+  final after = -trailing.characters.length;
   if (before.abs() > kMaxCaretMove || after.abs() > kMaxCaretMove) return null;
 
   return _Ops(before, deleted, inserted, after);
