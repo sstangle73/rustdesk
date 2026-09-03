@@ -54,6 +54,13 @@ const kMaxResync = 256;
 // Largest caret jump replayed as arrow keys.
 const kMaxCaretMove = 64;
 
+// Padding characters the IME may swallow to the right of the caret in one edit.
+// Gboard's double-space avoidance takes exactly one: correcting a word appends
+// a space, and rather than create a double space it eats the one that already
+// follows the caret - which is ours. Allow slack, but not enough to hide a real
+// edit.
+const kMaxPadAbsorb = 4;
+
 // The padding carries WORD BOUNDARIES, and that is not cosmetic.
 //
 // Gboard decides what to offer suggestions for by finding the word around the
@@ -189,7 +196,19 @@ _Ops? _replay(String oldText, int oldCaret, String newText, int newCaret) {
   // other than edit-at-the-caret and there is nothing safe to replay.
   if (oldCaret < 0 || newCaret < 0) return null;
   if (oldCaret > oldText.length || newCaret > newText.length) return null;
-  if (oldText.length - oldCaret != newText.length - newCaret) return null;
+
+  // The text after the caret should be untouched - but Gboard absorbs a space
+  // that already follows the caret rather than create a double space when it
+  // corrects a word, and that eats our right padding. Measured on a real trace:
+  // four of five bail-outs were this, rightOld=512 rightNew=511, and every one
+  // silently DISCARDED a correction the user had just accepted.
+  //
+  // Tolerate a small shrink and do not replay it. Those characters are padding:
+  // the remote never received them, and forward-deleting there would destroy
+  // the user's real text. The padding is repaired afterwards instead.
+  final absorbed =
+      (oldText.length - oldCaret) - (newText.length - newCaret);
+  if (absorbed < 0 || absorbed > kMaxPadAbsorb) return null;
 
   final o = oldText.substring(0, oldCaret).characters.toList();
   final n = newText.substring(0, newCaret).characters.toList();
@@ -574,6 +593,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       return;
     }
     _applyOps(ops);
+    _repairRightPad();
 
     // Keep room on both sides so the next scrub has somewhere to go.
     if (caret < kPadRefillThreshold ||
@@ -609,6 +629,26 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       }
     }
     _sendArrows(ops.arrowsAfter);
+  }
+
+  /// Put back any right padding the IME swallowed, without disturbing the text
+  /// to the left of the caret - which is what the keyboard needs in order to
+  /// offer suggestions for a word being edited. Only fires when the right side
+  /// has actually deviated, so this is a correction-time cost, not a
+  /// per-keystroke one.
+  void _repairRightPad() {
+    final text = _textController.text;
+    final caret = _lastCaret;
+    if (caret < 0 || caret > text.length) return;
+    if (text.substring(caret) == _padRight) return;
+    final repaired = text.substring(0, caret) + _padRight;
+    _suppressLocalSync = true;
+    _value = repaired;
+    _textController.value = TextEditingValue(
+      text: repaired,
+      selection: TextSelection.collapsed(offset: caret),
+    );
+    _suppressLocalSync = false;
   }
 
   /// Rebuild the scratch strip with the caret centred. Suppresses re-entry:
