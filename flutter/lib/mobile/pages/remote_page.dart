@@ -27,6 +27,103 @@ import '../widgets/custom_scale_widget.dart';
 
 final initText = '1' * 1024;
 
+// The local field is a SCRATCH STRIP, not a mirror of the remote.
+//
+// Its contents are meaningless padding. What matters is that each local edit
+// maps onto a remote operation - insert sends text, delete sends VK_BACK, caret
+// move sends VK_LEFT/VK_RIGHT. Only DELTAS are sent, never absolute positions,
+// so padding the remote has never seen costs nothing.
+//
+// Padding sits on BOTH sides of the caret. With padding only to the left the
+// caret is already at the end of the buffer, so a rightward space-bar scrub
+// produces no selection change at all and nothing is ever sent - which is
+// exactly how v70 could scrub left but not right.
+const kPadLeft = 1024;
+const kPadRight = 512;
+
+// Rebuild the padding when the caret gets within this of either end.
+// Rebuilding rewrites the field and disturbs the IME, so it has to be rare.
+const kPadRefillThreshold = 64;
+
+// An edit deleting more than this is the IME replacing the buffer wholesale,
+// not a human. Replaying it would fire a burst of VK_BACK at the remote.
+const kMaxResync = 256;
+
+// Largest caret jump replayed as arrow keys.
+const kMaxCaretMove = 64;
+
+final _freshPad = '1' * (kPadLeft + kPadRight);
+
+// Some IMEs insert both halves of a bracket pair in one edit. Sending only the
+// opening half means the closing one can never be typed at all.
+const kAutoPairedInserts = {
+  '""',
+  '()',
+  '[]',
+  '<>',
+  '{}',
+  '”“',
+  '《》',
+  '（）',
+  '【】',
+};
+
+// What to do about one local change. `null` from [_replay] means "cannot
+// express this - rebuild the buffer and send nothing".
+class _Ops {
+  final int arrowsBefore;
+  final int backspaces;
+  final String insert;
+  final int arrowsAfter;
+  _Ops(this.arrowsBefore, this.backspaces, this.insert, this.arrowsAfter);
+}
+
+// The algorithm. Pure, and deliberately kept that way: it is developed and
+// tested in home-network-docs/rustdesk/keyboard-difftest/ and copied here
+// verbatim. Change it there first.
+//
+// The caret is the ANCHOR, and it has to be. The padding is a uniform run of
+// identical characters, so a free longest-common-prefix/suffix diff cannot
+// locate an edit inside it - every position matches equally well. Asked where a
+// backspace happened it answered "512 characters that way", a perfectly valid
+// diff and completely wrong. The IME tells us where the caret is; use it.
+_Ops? _replay(String oldText, int oldCaret, String newText, int newCaret) {
+  if (oldText == newText) {
+    // Pure caret move - the space-bar scrub. Never reaches `onChanged`, which
+    // is why everything is driven from the controller listener instead.
+    final d = newCaret - oldCaret;
+    if (d == 0) return null;
+    if (d.abs() > kMaxCaretMove) return null;
+    return _Ops(0, 0, '', d);
+  }
+
+  // An IME edit ends AT the caret, so the text after it is untouched and the
+  // same length on both sides. If that does not hold, the IME did something
+  // other than edit-at-the-caret and there is nothing safe to replay.
+  if (oldCaret < 0 || newCaret < 0) return null;
+  if (oldCaret > oldText.length || newCaret > newText.length) return null;
+  if (oldText.length - oldCaret != newText.length - newCaret) return null;
+
+  final o = oldText.substring(0, oldCaret).characters.toList();
+  final n = newText.substring(0, newCaret).characters.toList();
+
+  var p = 0;
+  final maxP = o.length < n.length ? o.length : n.length;
+  while (p < maxP && o[p] == n[p]) {
+    p++;
+  }
+
+  final deleted = o.length - p;
+  final inserted = n.sublist(p).join();
+  if (deleted > kMaxResync) return null;
+
+  final before = (p + deleted) - oldCaret;
+  final after = newCaret - (p + inserted.characters.length);
+  if (before.abs() > kMaxCaretMove || after.abs() > kMaxCaretMove) return null;
+
+  return _Ops(before, deleted, inserted, after);
+}
+
 // Workaround for Android (default input method, Microsoft SwiftKey keyboard) when using physical keyboard.
 // When connecting a physical keyboard, `KeyEvent.physicalKey.usbHidUsage` are wrong is using Microsoft SwiftKey keyboard.
 // https://github.com/flutter/flutter/issues/159384
@@ -74,6 +171,11 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   final FocusNode _mobileFocusNode = FocusNode();
   final FocusNode _physicalFocusNode = FocusNode();
   var _showEdit = false; // use soft keyboard
+
+  // Local caret offset last replayed to the remote, as an absolute offset into
+  // the scratch strip. The remote caret is kept level with this by deltas.
+  int _lastCaret = kPadLeft;
+  bool _suppressLocalSync = false;
 
   Worker? _waylandKeyboardGateWorker;
   bool _waylandKeyboardGateInitialized = false;
@@ -126,6 +228,8 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
 
     inputModel.keyboardInputAllowed = true;
+    inputModel.onRemoteCaretMayHaveMoved = _onRemoteCaretMayHaveMoved;
+    _textController.addListener(_onLocalChanged);
 
     // Wayland sessions may use clipboard-based text input on the controlled side.
     // Require explicit user confirmation before allowing soft-keyboard and
@@ -162,6 +266,8 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     _physicalFocusNode.dispose();
     clearWaylandKeyboardPromptSuppressedForConnection(sessionId.toString());
     _waylandKeyboardGateWorker?.dispose();
+    inputModel.onRemoteCaretMayHaveMoved = null;
+    _textController.removeListener(_onLocalChanged);
     inputModel.keyboardInputAllowed = true;
     await gFFI.close();
     _timer?.cancel();
@@ -238,6 +344,10 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
         ),
       );
 
+  // A click moves the remote caret, and the shadow buffer has no way to see
+  // that from the local field alone — the text does not change. Reset it, or
+  // the next keystroke diffs against a buffer describing the OLD caret position
+  // and deletes text wherever the user just clicked.
   void onSoftKeyboardChanged(bool visible) {
     if (!visible) {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual, overlays: []);
@@ -325,45 +435,105 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     }
   }
 
-  void _handleNonIOSSoftKeyboardInput(String newValue) {
-    var oldValue = _value;
-    _value = newValue;
-    if (oldValue.isNotEmpty &&
-        newValue.isNotEmpty &&
-        oldValue[0] == '1' &&
-        newValue[0] != '1') {
-      // clipboard
-      oldValue = '';
+  // Replay the soft keyboard's edit on the remote.
+  //
+  // The IME hands us the entire field on every change, so a correction
+  // ("teh" -> "the") or a tapped suggestion arrives as an edit *inside* the
+  // string rather than as an append. The previous implementation compared
+  // lengths only: a same-length correction was dropped on the floor, and one
+  // that shortened the text sent a single VK_BACK no matter how many
+  // characters had actually gone. That is why `autocorrect` had to be off.
+  //
+  // Instead, find the longest common prefix, delete whatever follows it on the
+  // remote, and retype the new tail. Always converges on the right text, and
+  // needs no cursor movement -- the remote caret is already at the end of what
+  // we have sent, which is exactly where the deletions have to happen.
+  //
+  // Grapheme clusters rather than code units, so one emoji is one VK_BACK.
+  // Android drives EVERYTHING from the controller listener.
+  //
+  // `onChanged` fires only for text changes, and a caret move changes the
+  // selection without touching the text - so the space-bar scrub is invisible
+  // to it. Splitting the two across two callbacks meant two shadow states that
+  // could disagree; one path cannot.
+  void _onLocalChanged() {
+    if (_suppressLocalSync) return;
+    if (isIOS) return;
+    if (!inputModel.keyboardInputAllowed) return;
+
+    final v = _textController.value;
+    final sel = v.selection;
+    if (!sel.isValid || !sel.isCollapsed) return;
+    final text = v.text;
+    final caret = sel.baseOffset;
+    if (text == _value && caret == _lastCaret) return;
+
+    final ops = _replay(_value, _lastCaret, text, caret);
+    _value = text;
+    _lastCaret = caret;
+
+    if (ops == null) {
+      _refillPad();
+      return;
     }
-    if (newValue.length == oldValue.length) {
-      // ?
-    } else if (newValue.length < oldValue.length) {
-      final char = 'VK_BACK';
-      inputModel.inputKey(char);
-    } else {
-      final content = newValue.substring(oldValue.length);
-      if (content.length > 1) {
-        if (oldValue != '' &&
-            content.length == 2 &&
-            (content == '""' ||
-                content == '()' ||
-                content == '[]' ||
-                content == '<>' ||
-                content == "{}" ||
-                content == '”“' ||
-                content == '《》' ||
-                content == '（）' ||
-                content == '【】')) {
-          // can not only input content[0], because when input ], [ are also auo insert, which cause ] never be input
-          bind.sessionInputString(sessionId: sessionId, value: content);
-          _openKeyboardUnlocked();
+    _applyOps(ops);
+
+    // Keep room on both sides so the next scrub has somewhere to go.
+    if (caret < kPadRefillThreshold ||
+        caret > text.length - kPadRefillThreshold) {
+      _refillPad();
+    }
+  }
+
+  void _sendArrows(int delta) {
+    final key = delta > 0 ? 'VK_RIGHT' : 'VK_LEFT';
+    for (var i = 0; i < delta.abs(); i++) {
+      inputModel.inputKey(key);
+    }
+  }
+
+  void _applyOps(_Ops ops) {
+    _sendArrows(ops.arrowsBefore);
+    for (var i = 0; i < ops.backspaces; i++) {
+      inputModel.inputKey('VK_BACK');
+    }
+    final insert = ops.insert;
+    if (insert.isNotEmpty) {
+      if (insert.characters.length > 1) {
+        bind.sessionInputString(sessionId: sessionId, value: insert);
+        if (kAutoPairedInserts.contains(insert)) {
+          // Both halves of a bracket pair went out; the IME's idea of the field
+          // and ours diverge from here, so start clean.
+          _refillPad();
           return;
         }
-        bind.sessionInputString(sessionId: sessionId, value: content);
       } else {
-        inputChar(content);
+        inputChar(insert);
       }
     }
+    _sendArrows(ops.arrowsAfter);
+  }
+
+  /// Rebuild the scratch strip with the caret centred. Suppresses re-entry:
+  /// writing the controller notifies the listener, which would otherwise read
+  /// the rebuild back as a gigantic user edit.
+  void _refillPad() {
+    _suppressLocalSync = true;
+    _value = _freshPad;
+    _textController.value = TextEditingValue(
+      text: _freshPad,
+      selection: const TextSelection.collapsed(offset: kPadLeft),
+    );
+    _lastCaret = kPadLeft;
+    _suppressLocalSync = false;
+  }
+
+  // A click moves the remote caret, and no local signal says so - the text does
+  // not change. Rebuild, or the next edit replays arrow deltas measured from
+  // where the caret used to be.
+  void _onRemoteCaretMayHaveMoved() {
+    if (!mounted) return;
+    _refillPad();
   }
 
   // handle mobile virtual keyboard
@@ -371,10 +541,11 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     if (!inputModel.keyboardInputAllowed) {
       return;
     }
+    // Android is driven by `_onLocalChanged` off the controller listener, which
+    // sees selection changes too. Handling it here as well would replay every
+    // edit twice.
     if (isIOS) {
       _handleIOSSoftKeyboardInput(newValue);
-    } else {
-      _handleNonIOSSoftKeyboardInput(newValue);
     }
   }
 
@@ -415,9 +586,16 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   void _openKeyboardUnlocked() {
     inputModel.keyboardInputAllowed = true;
     gFFI.invokeMethod("enable_soft_keyboard", true);
-    // destroy first, so that our _value trick can work
-    _value = initText;
-    _textController.text = _value;
+    // destroy first, so that our _value trick can work.
+    // Android needs the two-sided scratch strip with the caret in the middle;
+    // `initText` alone puts it at the end of the buffer and the space-bar scrub
+    // has nowhere to move right. iOS still uses the original sentinel.
+    if (isIOS) {
+      _value = initText;
+      _textController.text = _value;
+    } else {
+      _refillPad();
+    }
     setState(() => _showEdit = false);
     _timer?.cancel();
     _timer = Timer(kMobileDelaySoftKeyboard, () {
@@ -676,7 +854,11 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                   ? Container()
                   : TextFormField(
                       textInputAction: TextInputAction.newline,
-                      autocorrect: false,
+                      // Maps to TYPE_TEXT_FLAG_AUTO_CORRECT on Android. Safe to
+                      // enable now that `_replay` can express a
+                      // mid-string replacement anchored on the caret; before,
+                      // a correction silently corrupted the remote text.
+                      autocorrect: true,
                       // Flutter 3.16.9 Android.
                       // `enableSuggestions` causes secure keyboard to be shown.
                       // https://github.com/flutter/flutter/issues/139143
