@@ -283,6 +283,23 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   int _lastCaret = kPadLeft;
   bool _suppressLocalSync = false;
 
+  // ⚠ Outbound input MUST be serialised.
+  //
+  // `bind.sessionInputKey` and `bind.sessionInputString` are both Future<void>
+  // and flutter_rust_bridge dispatches each to a worker thread, so N separate
+  // fire-and-forget calls arrive in ANY order. One correction is several
+  // backspaces plus a string; unserialised they interleave and the remote gets
+  // "logigingis" instead of "logging is". Seen in a trace where the computed
+  // ops were provably correct and the result on screen was not.
+  //
+  // Upstream never hit this because it only ever sent ONE operation per edit.
+  // Replaying an edit as several is what exposes it.
+  Future<void> _inputChain = Future.value();
+
+  void _enqueueInput(Future<void> Function() op) {
+    _inputChain = _inputChain.then((_) => op()).catchError((Object _) {});
+  }
+
   Worker? _waylandKeyboardGateWorker;
   bool _waylandKeyboardGateInitialized = false;
 
@@ -605,19 +622,20 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   void _sendArrows(int delta) {
     final key = delta > 0 ? 'VK_RIGHT' : 'VK_LEFT';
     for (var i = 0; i < delta.abs(); i++) {
-      inputModel.inputKey(key);
+      _enqueueInput(() => inputModel.inputKey(key));
     }
   }
 
   void _applyOps(_Ops ops) {
     _sendArrows(ops.arrowsBefore);
     for (var i = 0; i < ops.backspaces; i++) {
-      inputModel.inputKey('VK_BACK');
+      _enqueueInput(() => inputModel.inputKey('VK_BACK'));
     }
     final insert = ops.insert;
     if (insert.isNotEmpty) {
       if (insert.characters.length > 1) {
-        bind.sessionInputString(sessionId: sessionId, value: insert);
+        _enqueueInput(() =>
+            bind.sessionInputString(sessionId: sessionId, value: insert));
         if (kAutoPairedInserts.contains(insert)) {
           // Both halves of a bracket pair went out; the IME's idea of the field
           // and ours diverge from here, so start clean.
@@ -625,7 +643,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
           return;
         }
       } else {
-        inputChar(insert);
+        _enqueueInput(() => inputChar(insert));
       }
     }
     _sendArrows(ops.arrowsAfter);
@@ -690,7 +708,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     }
   }
 
-  void inputChar(String char) {
+  Future<void> inputChar(String char) async {
     if (!inputModel.keyboardInputAllowed) {
       return;
     }
@@ -699,7 +717,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     } else if (char == ' ') {
       char = 'VK_SPACE';
     }
-    inputModel.inputKey(char);
+    await inputModel.inputKey(char);
   }
 
   void openKeyboard() {
