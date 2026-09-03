@@ -52,7 +52,21 @@ const kMaxResync = 256;
 // Largest caret jump replayed as arrow keys.
 const kMaxCaretMove = 64;
 
-final _freshPad = '1' * (kPadLeft + kPadRight);
+// The padding carries WORD BOUNDARIES, and that is not cosmetic.
+//
+// Gboard decides what to offer suggestions for by finding the word around the
+// caret. With a uniform run of '1' on both sides there are no boundaries, so
+// the word is one enormous token and it offers nothing - which is why
+// backspacing or tapping back into a word gave no suggestions even though
+// typing a fresh one worked.
+//
+// The content is free: padding always falls inside the common prefix/suffix,
+// so it is never sent anywhere. Left padding must END with a separator and
+// right padding must START with one, or the typed word runs into the adjacent
+// '1' and is a single token again.
+final _padLeft = '1 ' * (kPadLeft ~/ 2);
+final _padRight = ' 1' * (kPadRight ~/ 2);
+final _freshPad = _padLeft + _padRight;
 
 // Some IMEs insert both halves of a bracket pair in one edit. Sending only the
 // opening half means the closing one can never be typed at all.
