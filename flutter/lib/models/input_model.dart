@@ -1088,7 +1088,15 @@ class InputModel {
     await sendMouse('up', button);
   }
 
+  /// Fired when something moves the REMOTE caret out from under the mobile soft
+  /// keyboard's shadow buffer. That buffer assumes the remote caret only ever
+  /// moves because of keystrokes it sent; a click puts it somewhere else, and a
+  /// later diff would then delete text at the new position. See
+  /// `_handleNonIOSSoftKeyboardInput` in mobile/pages/remote_page.dart.
+  VoidCallback? onRemoteCaretMayHaveMoved;
+
   Future<void> tapDown(MouseButtons button) async {
+    onRemoteCaretMayHaveMoved?.call();
     await sendMouse('down', button);
   }
 
