@@ -172,6 +172,17 @@ class _Ops {
   _Ops(this.arrowsBefore, this.backspaces, this.insert, this.arrowsAfter);
 }
 
+// Grapheme clusters between two UTF-16 offsets in [text].
+//
+// The IME reports carets in CODE UNITS; the remote moves and deletes by
+// CHARACTER. Mixing the two silently works for ASCII and breaks on the first
+// emoji, so every number crossing that boundary goes through here.
+int _graphemesBetween(String text, int a, int b) {
+  final lo = a < b ? a : b;
+  final hi = a < b ? b : a;
+  return text.substring(lo, hi).characters.length;
+}
+
 // The algorithm. Pure, and deliberately kept that way: it is developed and
 // tested in home-network-docs/rustdesk/keyboard-difftest/ and copied here
 // verbatim. Change it there first.
@@ -185,7 +196,10 @@ _Ops? _replay(String oldText, int oldCaret, String newText, int newCaret) {
   if (oldText == newText) {
     // Pure caret move - the space-bar scrub. Never reaches `onChanged`, which
     // is why everything is driven from the controller listener instead.
-    final d = newCaret - oldCaret;
+    if (newCaret == oldCaret) return null;
+    // Arrow keys move the remote by one CHARACTER, not one code unit.
+    final steps = _graphemesBetween(oldText, oldCaret, newCaret);
+    final d = newCaret > oldCaret ? steps : -steps;
     if (d == 0) return null;
     if (d.abs() > kMaxCaretMove) return null;
     return _Ops(0, 0, '', d);
@@ -243,7 +257,16 @@ _Ops? _replay(String oldText, int oldCaret, String newText, int newCaret) {
   final inserted = n.sublist(p).join() + trailing;
   if (deleted > kMaxResync) return null;
 
-  final before = (p + deleted) - oldCaret;
+  // Structurally ZERO: `o` is the text before the caret and `deleted` is
+  // `o.length - p`, so the deleted region always ends exactly at the caret and
+  // the remote caret is already there.
+  //
+  // This used to be `(p + deleted) - oldCaret`, which read like a harmless
+  // sanity check and was in fact a UNIT MISMATCH: the left side counts
+  // graphemes, `oldCaret` counts code units. Identical for ASCII; permanently
+  // off by one after the first emoji, emitting a stray VK_LEFT before every
+  // later edit and walking the remote caret backwards a character per word.
+  const before = 0;
   // Anything sent PAST the caret has to be walked back over afterwards.
   final after = -trailing.characters.length;
   if (before.abs() > kMaxCaretMove || after.abs() > kMaxCaretMove) return null;
