@@ -923,10 +923,43 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       // Disable RawKeyFocusScope before the connecting is established.
       // The "Delete" key on the soft keyboard may be grabbed when inputting the password dialog.
       child: gFFI.ffiModel.pi.isSet.isTrue
-          ? RawKeyFocusScope(
-              focusNode: _physicalFocusNode,
-              inputModel: inputModel,
-              child: child)
+          // An OBSERVING Focus above the real handler: it never consumes an
+          // event, it only notices the ones that change remote text without
+          // changing the local field.
+          //
+          // Backspace on the soft keyboard does not edit the invisible
+          // TextFormField at all -- it is taken by RawKeyFocusScope and sent
+          // straight to the host. Measured: 330 events in one session, the text
+          // got shorter exactly ONCE, and that once was a padding refill.
+          //
+          // So the shadow strip still contains a character the remote has
+          // already deleted. Typing after that is fine (an insert lands at the
+          // remote caret either way), but the next CORRECTION is computed
+          // against local text the remote no longer has, and deletes the wrong
+          // number of characters. That is why backspace and autocorrect broke
+          // together rather than separately.
+          //
+          // Invalidating the strip here costs a correction that straddles the
+          // backspace; the alternative is corrupting text.
+          ? Focus(
+              canRequestFocus: false,
+              skipTraversal: true,
+              onKeyEvent: (node, event) {
+                if (!isIOS && event is KeyDownEvent) {
+                  final k = event.logicalKey;
+                  if (k == LogicalKeyboardKey.backspace ||
+                      k == LogicalKeyboardKey.delete ||
+                      k == LogicalKeyboardKey.enter ||
+                      k == LogicalKeyboardKey.numpadEnter) {
+                    _refillPad();
+                  }
+                }
+                return KeyEventResult.ignored;
+              },
+              child: RawKeyFocusScope(
+                  focusNode: _physicalFocusNode,
+                  inputModel: inputModel,
+                  child: child))
           : child,
     );
   }
