@@ -736,6 +736,21 @@ class InputModel {
   }
 
   KeyEventResult handleRawKeyEvent(RawKeyEvent e) {
+    // Soft-keyboard backspace never edits the mobile page's hidden TextFormField
+    // -- it arrives here and goes straight to the host. Measured: 330 traced
+    // events, the local text got shorter exactly once, and that once was a
+    // padding refill. So the mobile shadow strip keeps a character the remote
+    // has already deleted, and the next CORRECTION is computed against text the
+    // remote no longer has. Tell the page to rebuild.
+    if (e is KeyDownEvent || e is RawKeyDownEvent) {
+      final k = e.logicalKey;
+      if (k == LogicalKeyboardKey.backspace ||
+          k == LogicalKeyboardKey.delete ||
+          k == LogicalKeyboardKey.enter ||
+          k == LogicalKeyboardKey.numpadEnter) {
+        onRemoteCaretMayHaveMoved?.call();
+      }
+    }
     if (isViewOnly) return KeyEventResult.handled;
     if (isViewCamera) return KeyEventResult.handled;
     if (!isInputSourceFlutter) {
@@ -821,6 +836,21 @@ class InputModel {
   }
 
   KeyEventResult handleKeyEvent(KeyEvent e) {
+    // Soft-keyboard backspace never edits the mobile page's hidden TextFormField
+    // -- it arrives here and goes straight to the host. Measured: 330 traced
+    // events, the local text got shorter exactly once, and that once was a
+    // padding refill. So the mobile shadow strip keeps a character the remote
+    // has already deleted, and the next CORRECTION is computed against text the
+    // remote no longer has. Tell the page to rebuild.
+    if (e is KeyDownEvent || e is RawKeyDownEvent) {
+      final k = e.logicalKey;
+      if (k == LogicalKeyboardKey.backspace ||
+          k == LogicalKeyboardKey.delete ||
+          k == LogicalKeyboardKey.enter ||
+          k == LogicalKeyboardKey.numpadEnter) {
+        onRemoteCaretMayHaveMoved?.call();
+      }
+    }
     if (isViewOnly) return KeyEventResult.handled;
     if (isViewCamera) return KeyEventResult.handled;
     if (!isInputSourceFlutter) {
