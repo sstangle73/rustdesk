@@ -220,29 +220,30 @@ _Ops? _replay(String oldText, int oldCaret, String newText, int newCaret) {
   // Tolerate a small shrink and do not replay it. Those characters are padding:
   // the remote never received them, and forward-deleting there would destroy
   // the user's real text. The padding is repaired afterwards instead.
-  // What sits right of the caret should be exactly the padding. Two deviations,
-  // both from real traces, and they are NOT symmetric:
+  // What sits right of the caret must be PADDING AND NOTHING ELSE.
   //
-  //  - SHORT: Gboard ate a pad space. It appends a space when correcting a word
-  //    and will not create a double space, so it takes ours. That is padding
-  //    the remote never received: ignore it, and repair the strip afterwards.
+  // This used to be a plain length tolerance that ignored any small right-hand
+  // shrink as "Gboard ate a pad space". That is only true when what vanished
+  // WAS padding. From a trace:
   //
-  //  - LONG: Gboard left real text right of the caret ("loving." -> "loging "
-  //    with the caret BEFORE the space). That is the user's text. Send it and
-  //    walk the caret back over it - treating it as padding drops a character,
-  //    which is what the first attempt at this did until the harness caught it.
+  //   n=37  "...super complicated |ard 1 1 1"   d11 i" complicated ard" a-3
+  //   n=38  "...super complicated |1 1 1"       d0  i"u"
   //
-  // Either way a bail-out here throws the WHOLE correction away, which is how
-  // both of these presented: autocorrect working intermittently.
-  if (((oldText.length - oldCaret) - (newText.length - newCaret)).abs() >
-      kMaxPadAbsorb) {
-    return null;
-  }
-  final rightText = newText.substring(newCaret);
-  var trailing = '';
-  if (rightText.length > _padRight.length && rightText.endsWith(_padRight)) {
-    trailing = rightText.substring(0, rightText.length - _padRight.length);
-  }
+  // Gboard corrected the word but left "ard" right of the caret; that was sent
+  // and the caret walked back. Then Gboard deleted the "ard" -- and the length
+  // check called it padding and ignored it. The remote kept three characters the
+  // local field had dropped, and every edit after that diverged.
+  //
+  // Padding may only ever shrink from its FRONT (double-space avoidance), so a
+  // legal right side is a suffix of _padRight. Anything else -- real text left
+  // there, or real text taken from there -- is not replayable by this model.
+  // Bail and rebuild rather than guess.
+  //
+  // Cost: a correction that leaves text right of the caret is dropped instead of
+  // replayed. Losing a correction is recoverable; corrupting the document is not.
+  if (!_padRight.endsWith(oldText.substring(oldCaret))) return null;
+  if (!_padRight.endsWith(newText.substring(newCaret))) return null;
+  const trailing = '';
 
   final o = oldText.substring(0, oldCaret).characters.toList();
   final n = newText.substring(0, newCaret).characters.toList();
@@ -922,44 +923,16 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       inputModel: inputModel,
       // Disable RawKeyFocusScope before the connecting is established.
       // The "Delete" key on the soft keyboard may be grabbed when inputting the password dialog.
+      // NOTE: an observing Focus wrapped around RawKeyFocusScope does NOT see
+      // soft-keyboard backspace. RawKeyFocusScope returns KeyEventResult.handled,
+      // which stops propagation before any ancestor runs. Tried in v78; measured
+      // 1 REFILL in 104 events, and that one was the session start. The hook
+      // lives in InputModel's key handlers instead.
       child: gFFI.ffiModel.pi.isSet.isTrue
-          // An OBSERVING Focus above the real handler: it never consumes an
-          // event, it only notices the ones that change remote text without
-          // changing the local field.
-          //
-          // Backspace on the soft keyboard does not edit the invisible
-          // TextFormField at all -- it is taken by RawKeyFocusScope and sent
-          // straight to the host. Measured: 330 events in one session, the text
-          // got shorter exactly ONCE, and that once was a padding refill.
-          //
-          // So the shadow strip still contains a character the remote has
-          // already deleted. Typing after that is fine (an insert lands at the
-          // remote caret either way), but the next CORRECTION is computed
-          // against local text the remote no longer has, and deletes the wrong
-          // number of characters. That is why backspace and autocorrect broke
-          // together rather than separately.
-          //
-          // Invalidating the strip here costs a correction that straddles the
-          // backspace; the alternative is corrupting text.
-          ? Focus(
-              canRequestFocus: false,
-              skipTraversal: true,
-              onKeyEvent: (node, event) {
-                if (!isIOS && event is KeyDownEvent) {
-                  final k = event.logicalKey;
-                  if (k == LogicalKeyboardKey.backspace ||
-                      k == LogicalKeyboardKey.delete ||
-                      k == LogicalKeyboardKey.enter ||
-                      k == LogicalKeyboardKey.numpadEnter) {
-                    _refillPad();
-                  }
-                }
-                return KeyEventResult.ignored;
-              },
-              child: RawKeyFocusScope(
-                  focusNode: _physicalFocusNode,
-                  inputModel: inputModel,
-                  child: child))
+          ? RawKeyFocusScope(
+              focusNode: _physicalFocusNode,
+              inputModel: inputModel,
+              child: child)
           : child,
     );
   }
