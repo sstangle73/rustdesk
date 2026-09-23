@@ -122,6 +122,8 @@ class FfiModel with ChangeNotifier {
   late VirtualMouseMode virtualMouseMode;
   Timer? _timer;
   Timer? _restartReconnectDelayTimer;
+  Timer? _privacyModeRetryTimer;
+  var _privacyModeRetries = 0;
   var _reconnects = 1;
   DateTime? _offlineReconnectStartTime;
   bool _viewOnly = false;
@@ -952,8 +954,14 @@ class FfiModel with ChangeNotifier {
       showConnectedWaitingForImage(dialogManager, sessionId, type, title, text);
     } else if (title == 'Privacy mode') {
       final hasRetry = evt['hasRetry'] == 'true';
-      showPrivacyFailedDialog(
-          sessionId, type, title, text, link, hasRetry, dialogManager);
+      if (_isTransientPrivacyModeError(type, text)) {
+        _handleTransientPrivacyModeError(
+            sessionId, type, title, text, link, hasRetry, dialogManager);
+      } else {
+        cancelPrivacyModeRetry();
+        showPrivacyFailedDialog(
+            sessionId, type, title, text, link, hasRetry, dialogManager);
+      }
     } else {
       var hasRetry = evt['hasRetry'] == 'true';
       if (!hasRetry) {
@@ -1175,6 +1183,82 @@ class FfiModel with ChangeNotifier {
       }
     });
     bind.sessionOnWaitingForImageDialogShow(sessionId: sessionId);
+  }
+
+  static const _kPrivacyModeImplVirtualDisplay =
+      'privacy_mode_impl_virtual_display';
+  static const _kPrivacyModeRetryInterval = Duration(seconds: 3);
+  static const _kPrivacyModeRetryMax = 40; // ~2 minutes
+
+  /// Windows refuses the display switch that the virtual-display privacy mode
+  /// needs while the peer is on the lock screen (the secure desktop), and
+  /// reports it as "Failed ChangeDisplaySettingsEx, ret: -1". The client
+  /// turns privacy mode on as soon as it connects, so connecting to a locked
+  /// peer always hits this. It clears by itself once the peer is unlocked.
+  bool _isTransientPrivacyModeError(String type, String text) {
+    return type == 'custom-error' && text.contains('ChangeDisplaySettingsEx');
+  }
+
+  void cancelPrivacyModeRetry() {
+    _privacyModeRetryTimer?.cancel();
+    _privacyModeRetryTimer = null;
+    _privacyModeRetries = 0;
+  }
+
+  void _handleTransientPrivacyModeError(
+      SessionID sessionId,
+      String type,
+      String title,
+      String text,
+      String link,
+      bool hasRetry,
+      OverlayDialogManager dialogManager) {
+    // Turning privacy mode OFF can fail with the same text, and retrying that
+    // by turning it ON would be wrong. A failed turn-on is followed by the
+    // session saving privacy mode as off; a failed turn-off leaves it on. The
+    // save races this message, so give it a moment before looking.
+    Future.delayed(const Duration(seconds: 1), () async {
+      if (parent.target == null || parent.target!.closed) return;
+      final stillOn = bind.sessionGetToggleOptionSync(
+          sessionId: sessionId, arg: 'privacy-mode');
+      final implKey =
+          stillOn ? null : await _privacyModeRetryImplKey(sessionId);
+      if (implKey == null || _privacyModeRetries >= _kPrivacyModeRetryMax) {
+        cancelPrivacyModeRetry();
+        showPrivacyFailedDialog(
+            sessionId, type, title, text, link, hasRetry, dialogManager);
+        return;
+      }
+      if (_privacyModeRetries == 0) {
+        showToast(
+            '${translate('Privacy mode')}: waiting for the remote side to be unlocked',
+            timeout: const Duration(seconds: 5));
+      }
+      _privacyModeRetries++;
+      _privacyModeRetryTimer?.cancel();
+      _privacyModeRetryTimer = Timer(_kPrivacyModeRetryInterval, () {
+        _privacyModeRetryTimer = null;
+        if (parent.target == null || parent.target!.closed) return;
+        bind.sessionTogglePrivacyMode(
+            sessionId: sessionId, implKey: implKey, on: true);
+      });
+    });
+  }
+
+  /// Only the virtual-display mode fails this way, so only it is retried.
+  Future<String?> _privacyModeRetryImplKey(SessionID sessionId) async {
+    final supported = (_pi.platformAdditions[
+                kPlatformAdditionsSupportedPrivacyModeImpl] as List<dynamic>?)
+            ?.map((e) => (e as List<dynamic>)[0] as String)
+            .toList() ??
+        [];
+    final saved = await bind.sessionGetOption(
+        sessionId: sessionId, arg: 'privacy-mode-impl-key');
+    if (saved == _kPrivacyModeImplVirtualDisplay &&
+        supported.contains(saved)) {
+      return saved;
+    }
+    return null;
   }
 
   void showPrivacyFailedDialog(
@@ -3747,6 +3831,7 @@ class FFI {
   /// Mobile reuse FFI
   void mobileReset() {
     ffiModel.resetRestartReconnectState();
+    ffiModel.cancelPrivacyModeRetry();
     ffiModel.waitForFirstImage.value = true;
     ffiModel.isRefreshing = false;
     ffiModel.waitForImageDialogShow.value = true;
