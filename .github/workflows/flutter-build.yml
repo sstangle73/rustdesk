@@ -285,7 +285,7 @@ jobs:
         # Same features and profile as the build above, so the compiled dependencies are reused.
         continue-on-error: true
         shell: bash
-        run: cargo test --locked --release --features hwcodec,vram,flutter --lib -- privacy_mode_defer
+        run: cargo test --locked --release --features hwcodec,vram,flutter --lib -- win_wait_unlock
 
       - name: find Runner.res
         # Windows: find Runner.res (compiled from ./flutter/windows/runner/Runner.rc), copy to ./Runner.res
