@@ -1253,6 +1253,10 @@ class FfiModel with ChangeNotifier {
         return;
       }
       if (_privacyModeRetries == 0) {
+        // The error box this replaces closes open dialogs first (msgBox calls
+        // dismissAll). Do the same, or the privacy-mode dialog the request came
+        // from stays over the lock screen the user has to type into.
+        dialogManager.dismissAll();
         showToast(
             '${translate('Privacy mode')}: waiting for the remote side to be unlocked',
             timeout: const Duration(seconds: 5));
