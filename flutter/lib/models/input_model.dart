@@ -736,6 +736,21 @@ class InputModel {
   }
 
   KeyEventResult handleRawKeyEvent(RawKeyEvent e) {
+    // A key that edits the remote outside the mobile page's shadow strip: it
+    // keeps a character the remote has already deleted (or misses a line break),
+    // and the next CORRECTION is computed against text the remote no longer
+    // has. Tell the page to rebuild. Soft-keyboard backspace is applied to the
+    // strip before it gets here (`_onSoftKeyboardFieldKey` in remote_page.dart);
+    // this still covers a physical keyboard, Enter, and Delete.
+    if (e is KeyDownEvent || e is RawKeyDownEvent) {
+      final k = e.logicalKey;
+      if (k == LogicalKeyboardKey.backspace ||
+          k == LogicalKeyboardKey.delete ||
+          k == LogicalKeyboardKey.enter ||
+          k == LogicalKeyboardKey.numpadEnter) {
+        onRemoteCaretMayHaveMoved?.call();
+      }
+    }
     if (isViewOnly) return KeyEventResult.handled;
     if (isViewCamera) return KeyEventResult.handled;
     if (!isInputSourceFlutter) {
@@ -821,6 +836,21 @@ class InputModel {
   }
 
   KeyEventResult handleKeyEvent(KeyEvent e) {
+    // A key that edits the remote outside the mobile page's shadow strip: it
+    // keeps a character the remote has already deleted (or misses a line break),
+    // and the next CORRECTION is computed against text the remote no longer
+    // has. Tell the page to rebuild. Soft-keyboard backspace is applied to the
+    // strip before it gets here (`_onSoftKeyboardFieldKey` in remote_page.dart);
+    // this still covers a physical keyboard, Enter, and Delete.
+    if (e is KeyDownEvent || e is RawKeyDownEvent) {
+      final k = e.logicalKey;
+      if (k == LogicalKeyboardKey.backspace ||
+          k == LogicalKeyboardKey.delete ||
+          k == LogicalKeyboardKey.enter ||
+          k == LogicalKeyboardKey.numpadEnter) {
+        onRemoteCaretMayHaveMoved?.call();
+      }
+    }
     if (isViewOnly) return KeyEventResult.handled;
     if (isViewCamera) return KeyEventResult.handled;
     if (!isInputSourceFlutter) {
@@ -1026,10 +1056,14 @@ class InputModel {
   /// Send key stroke event.
   /// [down] indicates the key's state(down or up).
   /// [press] indicates a click event(down and up).
-  void inputKey(String name, {bool? down, bool? press}) {
+  // Returns the bridge future so a caller that needs ORDER can await it.
+  // flutter_rust_bridge dispatches each call to a worker thread, so separate
+  // fire-and-forget calls have no ordering guarantee between them. Existing
+  // callers that ignore the result are unaffected.
+  Future<void> inputKey(String name, {bool? down, bool? press}) async {
     if (!keyboardPerm) return;
     if (isViewCamera) return;
-    bind.sessionInputKey(
+    await bind.sessionInputKey(
         sessionId: sessionId,
         name: name,
         down: down ?? false,
@@ -1088,7 +1122,15 @@ class InputModel {
     await sendMouse('up', button);
   }
 
+  /// Fired when something moves the REMOTE caret out from under the mobile soft
+  /// keyboard's shadow buffer. That buffer assumes the remote caret only ever
+  /// moves because of keystrokes it sent; a click puts it somewhere else, and a
+  /// later diff would then delete text at the new position. See
+  /// `_handleNonIOSSoftKeyboardInput` in mobile/pages/remote_page.dart.
+  VoidCallback? onRemoteCaretMayHaveMoved;
+
   Future<void> tapDown(MouseButtons button) async {
+    onRemoteCaretMayHaveMoved?.call();
     await sendMouse('down', button);
   }
 
