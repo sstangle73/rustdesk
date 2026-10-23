@@ -287,6 +287,17 @@ jobs:
         shell: bash
         run: cargo test --locked --release --features hwcodec,vram,flutter --lib -- win_wait_unlock
 
+      - name: Auto-login test, with the fix and then without its hook (test build only)
+        continue-on-error: true
+        shell: bash
+        run: |
+          t=auto_login_sends_the_password_after_the_first_video_frame
+          cargo test --locked --release --features hwcodec,vram,flutter --lib -- $t && echo "AUTOLOGIN WITH FIX: PASS" || echo "AUTOLOGIN WITH FIX: FAIL"
+          sed -i '/^ *self\.auto_login();\r\?$/d' src/client/io_loop.rs
+          git diff --stat
+          cargo test --locked --release --features hwcodec,vram,flutter --lib -- $t && echo "AUTOLOGIN WITHOUT HOOK: PASS (bad)" || echo "AUTOLOGIN WITHOUT HOOK: FAIL (expected)"
+          git checkout -- src/client/io_loop.rs
+
       - name: find Runner.res
         # Windows: find Runner.res (compiled from ./flutter/windows/runner/Runner.rc), copy to ./Runner.res
         # Runner.rc does not contain actual version, but Runner.res does
