@@ -39,6 +39,11 @@ pub const TURN_OFF_OTHER_ID: &'static str =
     "Failed to turn off privacy mode that belongs to someone else.";
 pub const NO_PHYSICAL_DISPLAYS: &'static str = "no_need_privacy_mode_no_physical_displays_tip";
 
+// Lets a request waiting for the unlock tell that another connection has turned privacy mode
+// on since it was queued.
+#[cfg(windows)]
+static TURN_ONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub const PRIVACY_MODE_IMPL_WIN_MAG: &str = "privacy_mode_impl_mag";
 pub const PRIVACY_MODE_IMPL_WIN_EXCLUDE_FROM_CAPTURE: &str =
     "privacy_mode_impl_exclude_from_capture";
@@ -77,6 +82,11 @@ pub trait PrivacyMode: Sync + Send {
         Ok(false)
     }
 
+    /// `INVALID_PRIVACY_MODE_CONN_ID` deliberately bypasses the ownership check, meaning
+    /// "turn it off whoever owns it": shutdown (`ipc::Data::Close`), `reset_all`, and
+    /// `TurnOnGuard`, which undoes a half-finished turn-on however far it got. A caller
+    /// acting for one connection must pass that connection's own id, or it can turn off
+    /// privacy mode belonging to another.
     #[inline]
     fn check_off_conn_id(&self, conn_id: i32) -> ResultType<()> {
         let pre_conn_id = self.pre_conn_id();
@@ -249,7 +259,14 @@ async fn turn_on_privacy_async(impl_key: String, conn_id: i32) -> Option<ResultT
 fn turn_on_privacy_sync(impl_key: &str, conn_id: i32) -> Option<ResultType<bool>> {
     // Check if privacy mode is already on or occupied by another one
     let mut privacy_mode_lock = PRIVACY_MODE.lock().unwrap();
+    turn_on_privacy_locked(&mut privacy_mode_lock, impl_key, conn_id)
+}
 
+fn turn_on_privacy_locked(
+    privacy_mode_lock: &mut Option<Box<dyn PrivacyMode>>,
+    impl_key: &str,
+    conn_id: i32,
+) -> Option<ResultType<bool>> {
     // Check or switch privacy mode implementation
     let impl_key = get_supported_impl(impl_key);
 
@@ -288,7 +305,35 @@ fn turn_on_privacy_sync(impl_key: &str, conn_id: i32) -> Option<ResultType<bool>
     }
 
     // turn on privacy mode
-    Some(privacy_mode_lock.as_mut()?.turn_on_privacy(conn_id))
+    let res = privacy_mode_lock.as_mut()?.turn_on_privacy(conn_id);
+    #[cfg(windows)]
+    if matches!(res, Ok(true)) {
+        TURN_ONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    Some(res)
+}
+
+#[cfg(not(target_os = "ios"))]
+pub(crate) fn close_other_remote_connections_for_privacy(owner_id: i32) {
+    use crate::server::{AuthConnType, AUTHED_CONNS};
+
+    let privacy_mode_lock = PRIVACY_MODE.lock().unwrap();
+    // Ownership can change while the caller validates the capturer.
+    if privacy_mode_lock.as_ref().map(|mode| mode.pre_conn_id()) != Some(owner_id) {
+        return;
+    }
+    for connection in AUTHED_CONNS.lock().unwrap().iter() {
+        if connection.conn_type != AuthConnType::Remote || connection.conn_id == owner_id {
+            continue;
+        }
+        if let Err(err) = connection.sender.send(crate::ipc::Data::Close) {
+            hbb_common::log::debug!(
+                "Failed to close connection {} for privacy mode: {}",
+                connection.conn_id,
+                err
+            );
+        }
+    }
 }
 
 #[inline]
