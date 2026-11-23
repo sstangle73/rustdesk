@@ -29,7 +29,7 @@ class SessionKeepAliveService : Service() {
         private const val CHANNEL_ID = "session_keep_alive"
         private const val NOTIFY_ID = 7301
         private const val ACTION_DISCONNECT = "SESSION_KEEP_ALIVE_DISCONNECT"
-        private const val BACKGROUND_LIMIT_MS = 60 * 60 * 1000L
+        private const val BACKGROUND_LIMIT_MS = 2 * 60 * 1000L // fork demo build only: 2 minutes
 
         private var running: SessionKeepAliveService? = null
         private var appHidden = false
